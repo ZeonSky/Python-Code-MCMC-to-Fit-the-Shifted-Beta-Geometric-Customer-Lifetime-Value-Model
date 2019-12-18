@@ -1,0 +1,183 @@
+# As an example, long term data on patient persistency is critical for constructing patient flow models in pharmaceutical forecasting. 
+# Persistency rates are typically available only for short at the aggregate level (e.g., persistency rates by month and product). 
+# A much longer duration of persistency rates is required in the analysis of patient flow models, usually 5 or 10 year horizons. 
+
+import os
+from IPython.display import Image, HTML
+CHART_DIR = os.path.join(os.getcwd(), 'charts/')
+Embed = Image(CHART_DIR + 'quadrant.png', retina=True)
+Embed
+
+%matplotlib inline
+%config InlineBackend.figure_format = 'retina'
+
+import numpy as np
+import scipy
+import pymc as pm
+import seaborn as sns
+import pandas as pd
+import matplotlib.pyplot as plt
+
+sns.set(style="white")
+current_palette = sns.color_palette()
+fig, ax = plt.subplots(figsize=(8,6))
+ax.set_ylim(0, 2)
+ax.set_xlim(0, 2)
+x = np.linspace(0, 1, 100)[1:99]
+subplot_locations = [[.6, .61, .25, .25], [.6, .21, .25, .25], [.2, .61, .25, .25], [.2, .21, .25, .25]]
+subplot_params = [(2, 7), (1.3, .7), (.7, 1.3), (.5, .5)]
+for loc, params in zip(subplot_locations, subplot_params):
+    ax_i = plt.axes(loc)
+    ax_i.plot(x, scipy.stats.beta.pdf(x, params[0], params[1]), '-')    
+    plt.setp(ax_i.get_yticklabels(), visible=False)
+    ax_i.axes.spines['right'].set_color('none')
+    ax_i.axes.spines['top'].set_color('none')
+    ax_i.set_xlabel(r'$\theta$')
+    ax_i.set_xticks([0., .5, 1])
+
+ax.set_title(r'General Shapes of the Beta Distribution as a Function of $\alpha$ and $\beta$')
+ax.axes.spines['right'].set_color('none')
+ax.axes.spines['top'].set_color('none')
+ax.plot([1, 1], ax.get_ylim(), '--', c='black', lw=1)
+ax.plot(ax.get_xlim(), [1, 1], '--', c='black', lw=1)
+ax.set_xticks([0., 1., 2.])
+ax.set_yticks([0., 1., 2.])
+ax.set_xticklabels(['0', '1', r'$\alpha$'])
+_ = ax.set_yticklabels(['0', '1', r'$\beta$'])
+
+example_data = [1000, 869, 743, 653, 593, 551, 517, 491]
+
+def n_lost(data):
+    lost = [None]
+    for i in range(1, len(data)):
+        lost.append(data[i - 1] - data[i])
+    return lost
+
+example_data_n_lost = n_lost(example_data)
+
+data = (example_data, example_data_n_lost)
+data
+
+
+alpha = pm.Uniform('alpha', 0.00001, 1000, value=1) 
+beta = pm.Uniform('beta', 0.00001, 1000, value=1)
+
+num_periods = len(example_data)
+
+@pm.deterministic
+def P_T_is_t(alpha=alpha, beta=beta, num_periods=num_periods):
+    p = [None, alpha / (alpha + beta)]
+    for t in range(2, num_periods):
+        pt = (beta + t - 2) / (alpha + beta + t - 1) * p[t-1]
+        p.append(pt)
+    return p
+    
+    
+@pm.deterministic
+def survival_function(P_T_is_t=P_T_is_t, num_periods=num_periods):
+    s = [None, 1 - P_T_is_t[1]]
+    for t in range(2, num_periods):
+        s.append(s[t-1] - P_T_is_t[t])
+    return s
+    
+
+@pm.observed
+def retention_rates(P_T_is_t=P_T_is_t, survival_function=survival_function, value=data):
+    def logp(value, P_T_is_t, survival_function):
+        
+        active, lost = value
+        
+        # Those who've churned along the way...
+        died = np.log(P_T_is_t[1:]) * lost[1:]
+        
+        # and those still active in last period
+        still_active = np.log(survival_function[-1]) * active[-1]              
+        return sum(died) + still_active
+        
+mcmc = pm.MCMC([alpha, beta, P_T_is_t, survival_function, retention_rates])
+retention_rates.logp
+
+
+mcmc.sample(20000, 5000, 20)
+
+sns.set(style="darkgrid")
+pm.Matplot.plot(alpha)
+
+pm.Matplot.plot(beta)
+
+df_trace = pd.DataFrame({'alpha': alpha.trace(), 'beta': beta.trace()})
+df_trace.median()
+
+# Discounted Expected Residual Lifetime
+
+from scipy.special import hyp2f1
+
+def derl(alpha, beta, d, n):
+    """
+    Discounted Expected Residual Lifetime, as derived in Fader and Hardie (2010).  See equation (6).
+
+    :param alpha: sBG alpha param
+    :param beta: sBG beta param
+    :param d: discount rate
+    :param n: customer's contract period (customer has made n-1 renewals)
+    :return: float
+    """
+    return (beta + n - 1) / (alpha + beta + n - 1) * hyp2f1(1, beta + n, alpha + beta + n, 1 / (1 + d))
+    
+
+df_trace['derl'] = df_trace.apply(lambda x: 1 + derl(x['alpha'], x['beta'], .1, 1), axis=1)
+df_trace['lifetime_value'] = 10 * df_trace.derl
+
+median_clv = df_trace.lifetime_value.median()
+cred_interval = df_trace.lifetime_value.quantile(.025), df_trace.lifetime_value.quantile(.975)
+ax = df_trace['lifetime_value'].hist()
+ax.set_title('Customer Lifetime Value (Discount Rate: .1)')
+ax.set_xlabel('Discounted Expected Customer Lifetime')
+ax.plot([median_clv, median_clv], ax.get_ylim())
+plt.annotate('Median: %.1f' % median_clv, xy=(median_clv + .02, ax.get_ylim()[1]-10))
+ax.plot([cred_interval[0], cred_interval[0]], ax.get_ylim(), c=sns.color_palette()[2], lw=1)
+_ = ax.plot([cred_interval[1], cred_interval[1]], ax.get_ylim(), c=sns.color_palette()[2], lw=1)
+
+
+example_data = [10 * x for x in example_data]
+example_data_n_lost = n_lost(example_data)
+
+data = (example_data, example_data_n_lost)
+data
+
+@pm.observed
+def retention_rates(P_T_is_t=P_T_is_t, survival_function=survival_function, value=data):
+    def logp(value, P_T_is_t, survival_function):
+        
+        active, lost = value
+        
+        # Those who've churned along the way...
+        died = np.log(P_T_is_t[1:]) * lost[1:]
+        
+        # and those still active in last period
+        still_active = np.log(survival_function[-1]) * active[-1]              
+        return sum(died) + still_active
+        
+mcmc = pm.MCMC([alpha, beta, P_T_is_t, survival_function, retention_rates])
+mcmc.sample(20000, 5000, 20)
+df_trace_10x = pd.DataFrame({'alpha': alpha.trace(), 'beta': beta.trace()})
+df_trace_10x['derl'] = df_trace_10x.apply(lambda x: 1 + derl(x['alpha'], x['beta'], .1, 1), axis=1)
+df_trace_10x['lifetime_value'] = 10 * df_trace_10x.derl
+
+f, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(8, 6))
+
+plots = [(ax1, df_trace, 'Original N'), (ax2, df_trace_10x, '10x N')]
+for ax, df, title in plots:
+    median_clv = df.lifetime_value.median()
+    cred_interval = df.lifetime_value.quantile(.025), df.lifetime_value.quantile(.975)
+    df['lifetime_value'].hist(ax=ax, lw=0)
+    ax.plot([median_clv, median_clv], ax.get_ylim())
+    ax.plot([cred_interval[0], cred_interval[0]], ax.get_ylim(), c=sns.color_palette()[2], lw=1)
+    _ = ax.plot([cred_interval[1], cred_interval[1]], ax.get_ylim(), c=sns.color_palette()[2], lw=1)
+    ax.text(.99, .9, title, verticalalignment='bottom', horizontalalignment='right', transform=ax.transAxes, fontsize=14)
+
+ax2.set_xlabel('Discounted Expected Customer Lifetime')
+_ = f.suptitle('Customer Lifetime Value (Discount Rate: .1), With Original and 10x Sample Size', fontsize=14)
+
+
+# Thank @https://disqus.com/by/danielweitzenfeld/ For the source code
